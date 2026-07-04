@@ -13,84 +13,42 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # DATABASE INTEGRATION STRATEGY:
-# Attempts to load Supabase PostgreSQL using psycopg2.
-# Falls back to an in-memory SQLite database if credentials are not configured,
-# ensuring the server stays resilient and starts successfully during local tests.
+# Connects to Neon PostgreSQL on Render.
+# Falls back to local in-memory SQLite if credentials are missing or connection fails.
 
 db_engine = "sqlite"
 conn = None
 
-# Attempting to load PostgreSQL connection (Supabase)
+# Get and sanitize Neon Database URL
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL:
+    # Modernize connection string scheme to ensure compatibility
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
     try:
         import psycopg2
         from psycopg2.extras import RealDictCursor
+        
+        # Connect to Neon PostgreSQL
         conn = psycopg2.connect(DATABASE_URL)
         conn.autocommit = True
         db_engine = "postgres"
-        logger.info("⚡ Successfully connected to Supabase PostgreSQL database!")
-        
-        # Automatically set up the PostgreSQL schema on startup
-        with conn.cursor() as cursor:
-            # 1. Create Projects Table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS projects (
-                    id VARCHAR(50) PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    status VARCHAR(50) NOT NULL CHECK (status IN ('Live', 'Workinprogress', 'Yet to start')),
-                    startdate DATE NOT NULL,
-                    manager VARCHAR(100) NOT NULL
-                );
-            """)
-            # 2. Create Discussions Table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS discussions (
-                    id VARCHAR(50) PRIMARY KEY,
-                    project_id VARCHAR(50) NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                    project_name TEXT NOT NULL,
-                    points TEXT NOT NULL,
-                    date DATE NOT NULL,
-                    remarks VARCHAR(50) NOT NULL CHECK (remarks IN ('Approved', 'Not Approved', 'Information', 'For Action', 'Hold', 'Not Relevant now'))
-                );
-            """)
-            # 3. Create Indexes for High Performance Querying
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_discussions_project ON discussions(project_id);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_discussions_remarks ON discussions(remarks);")
-            
-            # 4. Seed Initial Project Records
-            cursor.execute("""
-                INSERT INTO projects (id, name, status, startdate, manager) VALUES 
-                ('PRJ-001', 'Apollo Phoenix Upgrade', 'Live', '2026-01-15', 'Clara Oswald'),
-                ('PRJ-002', 'Enterprise Security Shield', 'Workinprogress', '2026-03-01', 'Marcus Aurelius'),
-                ('PRJ-003', 'Global Logistics Sync', 'Yet to start', '2026-08-10', 'Devon Rex')
-                ON CONFLICT (id) DO NOTHING;
-            """)
-            
-            # 5. Seed Initial Discussions Records
-            cursor.execute("""
-                INSERT INTO discussions (id, project_id, project_name, points, date, remarks) VALUES 
-                ('DSC-001', 'PRJ-001', 'Apollo Phoenix Upgrade', 'Completed phase 1 testing. API latency dropped by 34% after implementing caching cluster.', '2026-06-25', 'Approved'),
-                ('DSC-002', 'PRJ-002', 'Enterprise Security Shield', 'Identified dependency issues in the auth gateway. Deploying firewall hotfixes this afternoon.', '2026-07-02', 'For Action'),
-                ('DSC-003', 'PRJ-001', 'Apollo Phoenix Upgrade', 'Discussed adding multi-factor authentication requirements. Put on secondary roadmap.', '2026-06-29', 'Hold')
-                ON CONFLICT (id) DO NOTHING;
-            """)
-        logger.info("⚡ PostgreSQL tables initialized and seeded successfully!")
+        logger.info("⚡ Successfully connected to Neon PostgreSQL database!")
     except Exception as e:
-        logger.error(f"❌ PostgreSQL database setup failed: {e}. Falling back to SQLite.")
+        logger.error(f"❌ PostgreSQL database connection failed: {e}. Falling back to SQLite.")
         db_engine = "sqlite"
         conn = None
 
+# Fallback setup if PostgreSQL is unavailable
 if db_engine == "sqlite":
     import sqlite3
-    logger.info("📂 Using a local/in-memory SQLite database.")
-    # Initialize SQLite in-memory tables for immediate functionality
+    logger.info("📂 Using local in-memory SQLite database fallback.")
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Create tables
+    # Create SQLite fallback tables
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id TEXT PRIMARY KEY,
@@ -111,7 +69,7 @@ if db_engine == "sqlite":
         )
     """)
     
-    # Insert seed records
+    # Seed SQLite fallback tables
     cursor.execute("SELECT COUNT(*) FROM projects")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT INTO projects VALUES ('PRJ-001', 'Apollo Phoenix Upgrade', 'Live', '2026-01-15', 'Clara Oswald')")
@@ -131,7 +89,6 @@ def execute_query(query, params=(), fetch_all=False, fetch_one=False):
         from psycopg2.extras import RealDictCursor
         global conn
         try:
-            # Check connection status and reconnect if broken or uninitialized
             if conn is None or conn.closed:
                 conn = psycopg2.connect(DATABASE_URL)
                 conn.autocommit = True
@@ -147,7 +104,6 @@ def execute_query(query, params=(), fetch_all=False, fetch_one=False):
             logger.error(f"PostgreSQL Query Error: {e}")
             raise e
     else:
-        # SQLite execution
         cursor = conn.cursor()
         cursor.execute(query, params)
         if fetch_all:
@@ -214,7 +170,6 @@ def create_project():
         return jsonify({"error": "Missing required fields"}), 400
         
     try:
-        # Generate ID
         count_row = execute_query("SELECT COUNT(*) as count FROM projects", fetch_one=True)
         count = count_row.get("count") if count_row else 0
         new_id = f"PRJ-{str(count + 1).zfill(3)}"
@@ -259,7 +214,6 @@ def delete_project(id):
             else "DELETE FROM projects WHERE id = ?",
             (id,)
         )
-        # Also clean up related discussions as cascading delete
         execute_query(
             "DELETE FROM discussions WHERE project_id = %s" if db_engine == "postgres"
             else "DELETE FROM discussions WHERE project_id = ?",
@@ -293,7 +247,6 @@ def create_discussion():
         return jsonify({"error": "Missing fields"}), 400
         
     try:
-        # Generate ID
         count_row = execute_query("SELECT COUNT(*) as count FROM discussions", fetch_one=True)
         count = count_row.get("count") if count_row else 0
         new_id = f"DSC-{str(count + 1).zfill(3)}"
@@ -345,6 +298,5 @@ def delete_discussion(id):
 
 
 if __name__ == "__main__":
-    # Render and Cloud Run expect port 3000 or the PORT environment variable
     port = int(os.environ.get("PORT", 3000))
     app.run(host="0.0.0.0", port=port, debug=True)
