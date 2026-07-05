@@ -3,6 +3,8 @@ import logging
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -14,73 +16,45 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 # ==========================================
 # DATABASE CONNECTION
 # Connects to PostgreSQL (Neon) via DATABASE_URL.
-# Falls back to a local SQLite file if credentials are missing
-# or the connection fails, so the app still runs in dev.
+# No fallback — DATABASE_URL is required.
 # ==========================================
 
-db_engine = "sqlite"
-conn = None
-
 DATABASE_URL = os.environ.get("DATABASE_URL")
-if DATABASE_URL:
-    # Modernize connection string scheme to ensure compatibility
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL environment variable is not set. "
+        "Add it in Render → your service → Environment, using your Neon connection string."
+    )
 
-    try:
-        import psycopg2
+# Modernize connection string scheme to ensure compatibility
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-        conn = psycopg2.connect(DATABASE_URL)
-        conn.autocommit = True
-        db_engine = "postgres"
-        logger.info("⚡ Successfully connected to PostgreSQL database!")
-    except Exception as e:
-        logger.error(f"❌ PostgreSQL database connection failed: {e}. Falling back to SQLite.")
-        db_engine = "sqlite"
-        conn = None
-
-if db_engine == "sqlite":
-    import sqlite3
-
-    logger.info("📂 Using local SQLite database fallback (project_health.db).")
-    conn = sqlite3.connect("project_health.db", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+conn = psycopg2.connect(DATABASE_URL)
+conn.autocommit = True
+logger.info("⚡ Successfully connected to PostgreSQL database!")
 
 
 # ==========================================
 # DATABASE HELPERS
 # ==========================================
 def execute_query(query, params=(), fetch_all=False, fetch_one=False):
-    if db_engine == "postgres":
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-        global conn
-        try:
-            if conn is None or conn.closed:
-                conn = psycopg2.connect(DATABASE_URL)
-                conn.autocommit = True
+    global conn
+    try:
+        if conn is None or conn.closed:
+            conn = psycopg2.connect(DATABASE_URL)
+            conn.autocommit = True
 
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(query, params)
-                if fetch_all:
-                    return cur.fetchall()
-                if fetch_one:
-                    return cur.fetchone()
-                return None
-        except Exception as e:
-            logger.error(f"PostgreSQL Query Error: {e}")
-            raise e
-    else:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        if fetch_all:
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
-        if fetch_one:
-            row = cursor.fetchone()
-            return dict(row) if row else None
-        conn.commit()
-        return None
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            if fetch_all:
+                return cur.fetchall()
+            if fetch_one:
+                return cur.fetchone()
+            return None
+    except Exception as e:
+        logger.error(f"PostgreSQL Query Error: {e}")
+        raise e
 
 
 def init_db():
@@ -125,8 +99,8 @@ init_db()
 def health():
     return jsonify({
         "status": "healthy",
-        "database_engine": db_engine,
-        "postgres_connected": db_engine == "postgres",
+        "database_engine": "postgres",
+        "postgres_connected": True,
         "timestamp": datetime.utcnow().isoformat()
     })
 
@@ -148,8 +122,7 @@ def login():
     if role == "Project Manager":
         try:
             existing = execute_query(
-                "SELECT * FROM employees WHERE LOWER(email) = %s" if db_engine == "postgres"
-                else "SELECT * FROM employees WHERE LOWER(email) = ?",
+                "SELECT * FROM employees WHERE LOWER(email) = %s",
                 (email,), fetch_one=True
             )
 
@@ -163,8 +136,7 @@ def login():
                 new_id = f"EMP-{str(count + 1).zfill(3)}"
 
                 execute_query(
-                    "INSERT INTO employees (id, name, email, dept) VALUES (%s, %s, %s, %s)" if db_engine == "postgres"
-                    else "INSERT INTO employees (id, name, email, dept) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO employees (id, name, email, dept) VALUES (%s, %s, %s, %s)",
                     (new_id, name, email, "Engineering")
                 )
         except Exception as e:
@@ -204,8 +176,7 @@ def create_employee():
         new_id = f"EMP-{str(count + 1).zfill(3)}"
 
         execute_query(
-            "INSERT INTO employees (id, name, email, dept) VALUES (%s, %s, %s, %s)" if db_engine == "postgres"
-            else "INSERT INTO employees (id, name, email, dept) VALUES (?, ?, ?, ?)",
+            "INSERT INTO employees (id, name, email, dept) VALUES (%s, %s, %s, %s)",
             (new_id, name, email, dept)
         )
         return jsonify({"id": new_id, "name": name, "email": email, "dept": dept}), 201
@@ -225,22 +196,20 @@ def update_employee(id):
 
     try:
         existing = execute_query(
-            "SELECT * FROM employees WHERE id = %s" if db_engine == "postgres" else "SELECT * FROM employees WHERE id = ?",
+            "SELECT * FROM employees WHERE id = %s",
             (id,), fetch_one=True
         )
         old_name = existing.get("name") if existing else None
 
         execute_query(
-            "UPDATE employees SET name = %s, email = %s, dept = %s WHERE id = %s" if db_engine == "postgres"
-            else "UPDATE employees SET name = ?, email = ?, dept = ? WHERE id = ?",
+            "UPDATE employees SET name = %s, email = %s, dept = %s WHERE id = %s",
             (name, email, dept, id)
         )
 
         # Keep project manager references in sync if the name changed
         if old_name and old_name != name:
             execute_query(
-                "UPDATE projects SET manager = %s WHERE manager = %s" if db_engine == "postgres"
-                else "UPDATE projects SET manager = ? WHERE manager = ?",
+                "UPDATE projects SET manager = %s WHERE manager = %s",
                 (name, old_name)
             )
 
@@ -252,10 +221,7 @@ def update_employee(id):
 @app.route("/api/employees/<id>", methods=["DELETE"])
 def delete_employee(id):
     try:
-        execute_query(
-            "DELETE FROM employees WHERE id = %s" if db_engine == "postgres" else "DELETE FROM employees WHERE id = ?",
-            (id,)
-        )
+        execute_query("DELETE FROM employees WHERE id = %s", (id,))
         return jsonify({"message": f"Employee {id} removed."})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -290,8 +256,7 @@ def create_project():
         new_id = f"PRJ-{str(count + 1).zfill(3)}"
 
         execute_query(
-            "INSERT INTO projects (id, name, status, startdate, manager) VALUES (%s, %s, %s, %s, %s)" if db_engine == "postgres"
-            else "INSERT INTO projects (id, name, status, startdate, manager) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO projects (id, name, status, startdate, manager) VALUES (%s, %s, %s, %s, %s)",
             (new_id, name, status, startdate, manager)
         )
         return jsonify({"id": new_id, "name": name, "status": status, "startdate": startdate, "manager": manager}), 201
@@ -312,14 +277,12 @@ def update_project(id):
 
     try:
         execute_query(
-            "UPDATE projects SET name = %s, status = %s, startdate = %s, manager = %s WHERE id = %s" if db_engine == "postgres"
-            else "UPDATE projects SET name = ?, status = ?, startdate = ?, manager = ? WHERE id = ?",
+            "UPDATE projects SET name = %s, status = %s, startdate = %s, manager = %s WHERE id = %s",
             (name, status, startdate, manager, id)
         )
         # Keep the cached project_name on discussion rows in sync
         execute_query(
-            "UPDATE discussions SET project_name = %s WHERE project_id = %s" if db_engine == "postgres"
-            else "UPDATE discussions SET project_name = ? WHERE project_id = ?",
+            "UPDATE discussions SET project_name = %s WHERE project_id = %s",
             (name, id)
         )
         return jsonify({"message": "Project updated successfully", "id": id})
@@ -330,16 +293,8 @@ def update_project(id):
 @app.route("/api/projects/<id>", methods=["DELETE"])
 def delete_project(id):
     try:
-        execute_query(
-            "DELETE FROM projects WHERE id = %s" if db_engine == "postgres"
-            else "DELETE FROM projects WHERE id = ?",
-            (id,)
-        )
-        execute_query(
-            "DELETE FROM discussions WHERE project_id = %s" if db_engine == "postgres"
-            else "DELETE FROM discussions WHERE project_id = ?",
-            (id,)
-        )
+        execute_query("DELETE FROM projects WHERE id = %s", (id,))
+        execute_query("DELETE FROM discussions WHERE project_id = %s", (id,))
         return jsonify({"message": f"Project {id} and its discussions removed."})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -375,8 +330,7 @@ def create_discussion():
         new_id = f"DSC-{str(count + 1).zfill(3)}"
 
         execute_query(
-            "INSERT INTO discussions (id, project_id, project_name, points, date, remarks) VALUES (%s, %s, %s, %s, %s, %s)" if db_engine == "postgres"
-            else "INSERT INTO discussions (id, project_id, project_name, points, date, remarks) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO discussions (id, project_id, project_name, points, date, remarks) VALUES (%s, %s, %s, %s, %s, %s)",
             (new_id, project_id, project_name, points, date, remarks)
         )
         return jsonify({
@@ -401,8 +355,7 @@ def update_discussion(id):
 
     try:
         execute_query(
-            "UPDATE discussions SET project_id = %s, project_name = %s, points = %s, date = %s, remarks = %s WHERE id = %s" if db_engine == "postgres"
-            else "UPDATE discussions SET project_id = ?, project_name = ?, points = ?, date = ?, remarks = ? WHERE id = ?",
+            "UPDATE discussions SET project_id = %s, project_name = %s, points = %s, date = %s, remarks = %s WHERE id = %s",
             (project_id, project_name, points, date, remarks, id)
         )
         return jsonify({"message": "Discussion log updated successfully", "id": id})
@@ -413,11 +366,7 @@ def update_discussion(id):
 @app.route("/api/discussions/<id>", methods=["DELETE"])
 def delete_discussion(id):
     try:
-        execute_query(
-            "DELETE FROM discussions WHERE id = %s" if db_engine == "postgres"
-            else "DELETE FROM discussions WHERE id = ?",
-            (id,)
-        )
+        execute_query("DELETE FROM discussions WHERE id = %s", (id,))
         return jsonify({"message": f"Discussion {id} deleted."})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
