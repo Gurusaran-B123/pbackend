@@ -343,6 +343,15 @@ def create_department():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/departments/<int:id>", methods=["DELETE"])
+def delete_department(id):
+    try:
+        execute_query("DELETE FROM departments WHERE id = %s", (id,))
+        return jsonify({"message": f"Department {id} deleted."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ==========================================
 # DISCUSSIONS API
 # ==========================================
