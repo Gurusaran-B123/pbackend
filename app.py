@@ -87,6 +87,12 @@ def init_db():
             remarks TEXT NOT NULL
         )
     """)
+    execute_query("""
+        CREATE TABLE IF NOT EXISTS departments (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE
+        )
+    """)
 
 
 init_db()
@@ -296,6 +302,43 @@ def delete_project(id):
         execute_query("DELETE FROM projects WHERE id = %s", (id,))
         execute_query("DELETE FROM discussions WHERE project_id = %s", (id,))
         return jsonify({"message": f"Project {id} and its discussions removed."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# DEPARTMENTS API
+# ==========================================
+@app.route("/api/departments", methods=["GET"])
+def get_departments():
+    try:
+        departments = execute_query("SELECT * FROM departments ORDER BY name ASC", fetch_all=True)
+        return jsonify(departments)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/departments", methods=["POST"])
+def create_department():
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+
+    if not name:
+        return jsonify({"error": "Department name is required"}), 400
+
+    try:
+        existing = execute_query(
+            "SELECT * FROM departments WHERE LOWER(name) = LOWER(%s)",
+            (name,), fetch_one=True
+        )
+        if existing:
+            return jsonify(existing), 200
+
+        created = execute_query(
+            "INSERT INTO departments (name) VALUES (%s) RETURNING id, name",
+            (name,), fetch_one=True
+        )
+        return jsonify(created), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
